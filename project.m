@@ -13,7 +13,7 @@ function project()
     
     % Display results to verify Phase 1 worked alter for other phases
     figure;
-    subplot(1,2,1); imshow(featureMap); title('contrast');
+    subplot(1,2,1); imshow(featureMap); title('FeatureMap');
     subplot(1,2,2); imshow(gt);  title('Ground Truth Mask');
     
     
