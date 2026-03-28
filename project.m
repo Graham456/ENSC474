@@ -11,10 +11,12 @@ function project()
     contrast_out = contrast_enhancement(homo_filter_out);
     featureMap = generate_features(contrast_out);
     binaryMask = segment_image(featureMap);
+    cleanMask = refine_mask(binaryMask);
+    finalMask = select_best_lesion(cleanMask);
     
     % Display results to verify Phase 1 worked alter for other phases
     figure;
-    subplot(1,2,1); imshow(featureMap); title('FeatureMap');
+    subplot(1,2,1); imshow(binaryMask); title('binaryMask');
     subplot(1,2,2); imshow(gt);  title('Ground Truth Mask');
     
     
@@ -150,11 +152,67 @@ function binaryMask = segment_image(featureMap)
     threshold = avgVal + (k * stdVal);
     
     % 3. Create the Binary Mask (Logical 0 or 1)
-    binaryMask = featureMap > threshold;
+    binaryMask = featureMap < threshold;
     
     % Visualizing for the user in the Command Window
     fprintf('Phase 5: Threshold set at %.4f (Mean: %.4f, Std: %.4f)\n', ...
             threshold, avgVal, stdVal);
+end
+function cleanMask = refine_mask(binaryMask)
+    se = strel('disk', 5); % create structuring element with a radius of 5
+    cleanMask = imopen(binaryMask, se); % opening: erosion followed by dialation
+    cleanMask = imfill(cleanMask, 'holes');
+    
+    % 4. Morphological Closing (Dilation followed by Erosion)
+    % This 'putties' small gaps on the edges and smooths the overall boundary.
+    cleanMask = imclose(cleanMask, se); % dialation and then erosion
+end
+function finalMask = select_best_lesion(cleanMask)
+    % 1. Label each connected white region with a unique ID
+    % [labeledImage, numRegions] = bwlabel(cleanMask);
+    stats = regionprops(cleanMask, 'Area', 'Centroid', 'Solidity', 'BoundingBox');
+    
+    if isempty(stats)
+        finalMask = cleanMask; % Return empty if nothing was found
+        fprintf('Phase 7: No regions detected.\n');
+        return;
+    end
+    
+    % 2. Calculate the Image Center
+    [rows, cols] = size(cleanMask);
+    imgCenter = [cols/2, rows/2];
+    % We rank each region based on three 'Clinical' factors:
+    % - Area: Tumors are usually the largest object.
+    % - Distance: Tumors are usually near the center.
+    % - Solidity: Tumors are usually solid 'blobs', not thin lines.
+    
+    numRegions = length(stats);
+    scores = zeros(numRegions, 1);
+    
+    for i = 1:numRegions
+        % Distance from center (lower is better)
+        dist = sqrt(sum((stats(i).Centroid - imgCenter).^2));
+        
+        % Area (higher is better, up to a point)
+        area = stats(i).Area;
+        
+        % Solidity (ratio of pixels in the region to the convex hull)
+        solidity = stats(i).Solidity;
+        
+        % THE FORMULA: 
+        % We weight Area and Solidity positively, and Distance negatively.
+        scores(i) = (area * 0.4) + (solidity * 500) - (dist * 1.5);
+    end
+    
+    % 4. Identify the Winner
+    [~, bestIdx] = max(scores);
+    
+    % 5. Reconstruct the Final Mask
+    % Create a mask that ONLY contains the winning object
+    labeledImage = bwlabel(cleanMask);
+    finalMask = (labeledImage == bestIdx);
+    
+    fprintf('Phase 7: Selected region %d as the most likely tumor.\n', bestIdx);
 end
 
 
