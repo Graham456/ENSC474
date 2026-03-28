@@ -12,11 +12,12 @@ function project()
     featureMap = generate_features(contrast_out);
     binaryMask = segment_image(featureMap);
     cleanMask = refine_mask(binaryMask);
-    finalMask = select_best_lesion(cleanMask);
+    splitMask = apply_watershed(cleanMask);
+    finalMask = select_best_lesion(splitMask);
     
     % Display results to verify Phase 1 worked alter for other phases
     figure;
-    subplot(1,2,1); imshow(binaryMask); title('binaryMask');
+    subplot(1,2,1); imshow(finalMask); title('finalMask');
     subplot(1,2,2); imshow(gt);  title('Ground Truth Mask');
     
     
@@ -148,8 +149,8 @@ function binaryMask = segment_image(featureMap)
     % Logic: If a pixel is 'k' standard deviations above the average, 
     % it is likely part of a tumor (the bright regions of the feature map).
     % Start with k = 1.0. Increase it if the mask is too 'noisy'.
-    k = 1.0; 
-    threshold = avgVal + (k * stdVal);
+    k = 0.5 ; 
+    threshold = avgVal + (k * stdVal); 
     
     % 3. Create the Binary Mask (Logical 0 or 1)
     binaryMask = featureMap < threshold;
@@ -159,6 +160,8 @@ function binaryMask = segment_image(featureMap)
             threshold, avgVal, stdVal);
 end
 function cleanMask = refine_mask(binaryMask)
+    [rows, cols] = size(binaryMask);
+    binaryMask(rows-10:rows, :) = 0;
     se = strel('disk', 5); % create structuring element with a radius of 5
     cleanMask = imopen(binaryMask, se); % opening: erosion followed by dialation
     cleanMask = imfill(cleanMask, 'holes');
@@ -167,53 +170,66 @@ function cleanMask = refine_mask(binaryMask)
     % This 'putties' small gaps on the edges and smooths the overall boundary.
     cleanMask = imclose(cleanMask, se); % dialation and then erosion
 end
-function finalMask = select_best_lesion(cleanMask)
-    % 1. Label each connected white region with a unique ID
-    % [labeledImage, numRegions] = bwlabel(cleanMask);
-    stats = regionprops(cleanMask, 'Area', 'Centroid', 'Solidity', 'BoundingBox');
+
+%APPLY WATERSHEDDING TO FINAL MASK
+function cleanMask = apply_watershed(cleanMask)
+    % 1. Compute Distance Transform
+    % Calculates the distance from every '1' to the nearest '0'.
+    % The center of the tumor becomes the deepest point.
+    D = bwdist(~cleanMask);
     
-    if isempty(stats)
-        finalMask = cleanMask; % Return empty if nothing was found
-        fprintf('Phase 7: No regions detected.\n');
+    % 2. Invert the distance map so the centers become 'Basins' (minima)
+    D = -D;
+    
+    % 3. Force pixels outside the refinedMask to be 'Infinity'
+    % This prevents the 'water' from leaking into the background.
+    D(~cleanMask) = Inf;
+    
+    % 4. Apply Watershed
+    % L contains labels for each 'flooded' basin.
+    L = watershed(D);
+    
+    % 5. Extract the objects
+    % Watershed lines (dams) are marked as 0. Everything else is a basin.
+    cleanMask = (L > 0) & cleanMask;
+    
+    % 6. Optional: Close tiny gaps created by the watershed lines
+    cleanMask = imclose(cleanMask, strel('disk', 1));
+end
+
+function finalMask = select_best_lesion(cleanMask)
+    % 1. Label each separate 'island' of pixels
+    [L, num] = bwlabel(cleanMask);
+    
+    if num == 0
+        finalMask = cleanMask;
         return;
     end
     
-    % 2. Calculate the Image Center
+    % 2. Measure properties of every island
+    stats = regionprops(L, 'Area', 'Centroid', 'Solidity');
+    
     [rows, cols] = size(cleanMask);
     imgCenter = [cols/2, rows/2];
-    % We rank each region based on three 'Clinical' factors:
-    % - Area: Tumors are usually the largest object.
-    % - Distance: Tumors are usually near the center.
-    % - Solidity: Tumors are usually solid 'blobs', not thin lines.
     
-    numRegions = length(stats);
-    scores = zeros(numRegions, 1);
-    
-    for i = 1:numRegions
-        % Distance from center (lower is better)
+    % 3. Rank them to find the 'True' tumor
+    scores = zeros(num, 1);
+    for i = 1:num
+        % Distance from center (Tumors are central, artifacts are at edges)
         dist = sqrt(sum((stats(i).Centroid - imgCenter).^2));
         
-        % Area (higher is better, up to a point)
+        % Area (Tumors are significant, but not the whole screen)
         area = stats(i).Area;
         
-        % Solidity (ratio of pixels in the region to the convex hull)
-        solidity = stats(i).Solidity;
-        
-        % THE FORMULA: 
-        % We weight Area and Solidity positively, and Distance negatively.
-        scores(i) = (area * 0.4) + (solidity * 500) - (dist * 1.5);
+        % Scoring: Big Area + High Solidity - High Distance
+        scores(i) = (area * 0.05) + (stats(i).Solidity * 1000) - (dist * 10);
     end
     
-    % 4. Identify the Winner
+    % 4. Keep only the highest scoring island
     [~, bestIdx] = max(scores);
-    
-    % 5. Reconstruct the Final Mask
-    % Create a mask that ONLY contains the winning object
-    labeledImage = bwlabel(cleanMask);
-    finalMask = (labeledImage == bestIdx);
-    
-    fprintf('Phase 7: Selected region %d as the most likely tumor.\n', bestIdx);
+    finalMask = (L == bestIdx);
 end
+
 
 
 
