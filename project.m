@@ -15,12 +15,36 @@ function project()
     splitMask = apply_watershed(cleanMask);
     finalMask = select_best_lesion(splitMask);
     
-    % Display results to verify Phase 1 worked alter for other phases
-    figure;
-    subplot(1,2,1); imshow(finalMask); title('finalMask');
-    subplot(1,2,2); imshow(gt);  title('Ground Truth Mask');
+     % DEBUG: show every intermediate stage so we can see where it breaks
+    figure('Name', 'Pipeline Debug', 'Position', [100 100 1400 800]);
     
+    subplot(2,4,1); imshow(img);            title('1. Raw Input');
+    subplot(2,4,2); imshow(homo_filter_out);title('2. Homomorphic');
+    subplot(2,4,3); imshow(contrast_out);   title('3. Contrast Enhanced');
+    subplot(2,4,4); imshow(featureMap);     title('4. Feature Map');
+    subplot(2,4,5); imshow(binaryMask);     title('5. Binary Mask');
+    subplot(2,4,6); imshow(cleanMask);      title('6. Refined Mask');
+    subplot(2,4,7); imshow(splitMask);      title('7. After Watershed');
+    subplot(2,4,8); imshow(finalMask);      title('8. Final vs GT');
     
+    % Also print the feature map stats so we can see the value distribution
+    fprintf('--- Feature Map Stats ---\n');
+    fprintf('Min: %.4f, Max: %.4f\n', min(featureMap(:)), max(featureMap(:)));
+    fprintf('Mean: %.4f, Std: %.4f\n', mean(featureMap(:)), std(featureMap(:)));
+    fprintf('Pixels above 0.5: %d\n', sum(featureMap(:) > 0.5));
+    fprintf('Pixels above 0.7: %d\n', sum(featureMap(:) > 0.7));
+    fprintf('Pixels above 0.9: %d\n', sum(featureMap(:) > 0.9));
+
+    % Overlay comparison: red = finalMask, green = ground truth
+    figure('Name', 'Overlay Comparison');
+    overlayImg = zeros(size(img,1), size(img,2), 3);
+    gt_resized = imresize(gt, [size(img,1), size(img,2)], 'nearest');
+
+    overlayImg(:,:,1) = double(finalMask);   % red channel = your detection
+    overlayImg(:,:,2) = double(gt_resized);          % green channel = ground truth
+    imshow(overlayImg);
+    title('Red=finalMask | Green=GT | Yellow=Overlap');
+
     fprintf('Phase 1 Complete using %s and %s.\n', imagePath, maskPath);
 end
 
@@ -32,6 +56,11 @@ function [imgNorm, gtMask] = preprocess_data(imgP, mskP)
     if size(rawImg, 3) == 3, rawImg = rgb2gray(rawImg); end % convert to 2D greyscale if images are 2D (RGB)
     if size(rawGT, 3) == 3,  rawGT  = rgb2gray(rawGT);  end
     
+    if any(size(rawGT) ~= size(rawImg)) % added when i had to resize GT image to fix error
+        rawGT = imresize(rawGT, [size(rawImg,1), size(rawImg,2)], 'nearest');
+        fprintf('Warning: GT mask resized from original to match image dimensions.\n');
+    end
+
     lower = quantile(rawImg(:), 0.01); % remove top and bottom 1% to ignore bright text or black borders
     upper = quantile(rawImg(:), 0.99); 
     
@@ -110,67 +139,61 @@ function contrast_out = contrast_enhancement(homo_filter_out)
 end
 
 function featureMap = generate_features(contrast_out)
-    % 1. Gradient Magnitude (Sobel Operators)
-    % We define the kernels manually as per your project requirements
     Gx = [-1 0 1; -2 0 2; -1 0 1];
     Gy = [1 2 1; 0 0 0; -1 -2 -1];
-    
     gradX = imfilter(contrast_out, Gx, 'replicate');
     gradY = imfilter(contrast_out, Gy, 'replicate');
     gradMag = sqrt(gradX.^2 + gradY.^2);
-    % Normalize gradient
-    gradMag = gradMag / max(gradMag(:));
-    
-    % Local Variance
-    % Measures texture heterogeneity. Window size 7x7 is good for US images.
-    h = ones(7,7) / (7*7);
-    mu = imfilter(contrast_out, h, 'replicate');
-    mu2 = imfilter(contrast_out.^2, h, 'replicate');
-    localVar = mu2 - mu.^2; 
-    % Normalize variance
-    localVar = localVar / max(localVar(:));
-    
-    % Combined Feature Map
-    % We want regions with high variance OR strong edges.
-    % We also invert the intensity: Tumors are dark, so (1 - contrast_out) makes them bright
-    intensityFeature = 1 - contrast_out;
-    
-    featureMap = (0.4 * intensityFeature) + (0.3 * gradMag) + (0.3 * localVar);
-    featureMap = (featureMap - min(featureMap(:))) / (max(featureMap(:)) - min(featureMap(:)));   
-end
+    if max(gradMag(:)) > 0
+        gradMag = gradMag / max(gradMag(:));
+    end
 
+    hVar = ones(7,7) / (7*7);
+    mu  = imfilter(contrast_out, hVar, 'replicate');
+    mu2 = imfilter(contrast_out.^2, hVar, 'replicate');
+    localVar = max(0, mu2 - mu.^2);
+    if max(localVar(:)) > 0
+        localVar = localVar / max(localVar(:));
+    end
+
+    % Go back to hypoechoic (dark tumor) assumption but with gentler smoothing
+    intensityFeature = 1 - contrast_out;
+
+    rawMap = (0.5 * intensityFeature) + (0.25 * gradMag) + (0.25 * localVar);
+
+    % Single moderate gaussian — previous large sigma was destroying boundaries
+    smoothedMap = imfilter(rawMap, fspecial('gaussian', [21 21], 4.0), 'replicate');
+
+    featureMap = (smoothedMap - min(smoothedMap(:))) / ...
+                 (max(smoothedMap(:)) - min(smoothedMap(:)));
+end
 function binaryMask = segment_image(featureMap)
-    % Calculate the statistical properties of the entire map
-    % fMap(:) flattens the 2D matrix into a 1D list for statistics
     avgVal = mean(featureMap(:));
     stdVal = std(featureMap(:));
-    
-    % Determine the Adaptive Threshold
-    % Logic: If a pixel is 'k' standard deviations above the average, 
-    % it is likely part of a tumor (the bright regions of the feature map).
-    % Start with k = 1.0. Increase it if the mask is too 'noisy'.
-    k = 0.5 ; 
-    threshold = avgVal + (k * stdVal); 
-    
-    % 3. Create the Binary Mask (Logical 0 or 1)
-    binaryMask = featureMap < threshold;
-    
-    % Visualizing for the user in the Command Window
+
+    % k=0.8 is a middle ground — strict enough to cut noise,
+    % loose enough to capture a large lesion region
+    k = 0.7;
+    threshold = avgVal + (k * stdVal);
+    binaryMask = featureMap > threshold;
+
     fprintf('Phase 5: Threshold set at %.4f (Mean: %.4f, Std: %.4f)\n', ...
             threshold, avgVal, stdVal);
 end
 function cleanMask = refine_mask(binaryMask)
-    [rows, cols] = size(binaryMask);
+    [rows, ~] = size(binaryMask);
     binaryMask(rows-10:rows, :) = 0;
-    se = strel('disk', 5); % create structuring element with a radius of 5
-    cleanMask = imopen(binaryMask, se); % opening: erosion followed by dialation
-    cleanMask = imfill(cleanMask, 'holes');
-    
-    % 4. Morphological Closing (Dilation followed by Erosion)
-    % This 'putties' small gaps on the edges and smooths the overall boundary.
-    cleanMask = imclose(cleanMask, se); % dialation and then erosion
-end
 
+    % FIX: Use smaller structuring element — radius 5 was eroding small
+    % detections into nothing before they could be grown
+    se_open  = strel('disk', 2);
+    se_close = strel('disk', 8);  % larger closing to bridge internal gaps
+
+    cleanMask = imopen(binaryMask, se_open);
+    cleanMask = imfill(cleanMask, 'holes');
+    cleanMask = imclose(cleanMask, se_close);
+    cleanMask = imfill(cleanMask, 'holes');  % fill again after closing
+end
 %APPLY WATERSHEDDING TO FINAL MASK
 function cleanMask = apply_watershed(cleanMask)
     % 1. Compute Distance Transform
@@ -198,39 +221,32 @@ function cleanMask = apply_watershed(cleanMask)
 end
 
 function finalMask = select_best_lesion(cleanMask)
-    % 1. Label each separate 'island' of pixels
     [L, num] = bwlabel(cleanMask);
-    
+
     if num == 0
         finalMask = cleanMask;
         return;
     end
-    
-    % 2. Measure properties of every island
+
     stats = regionprops(L, 'Area', 'Centroid', 'Solidity');
-    
     [rows, cols] = size(cleanMask);
     imgCenter = [cols/2, rows/2];
-    
-    % 3. Rank them to find the 'True' tumor
+
     scores = zeros(num, 1);
     for i = 1:num
-        % Distance from center (Tumors are central, artifacts are at edges)
         dist = sqrt(sum((stats(i).Centroid - imgCenter).^2));
-        
-        % Area (Tumors are significant, but not the whole screen)
         area = stats(i).Area;
-        
-        % Scoring: Big Area + High Solidity - High Distance
-        scores(i) = (area * 0.05) + (stats(i).Solidity * 1000) - (dist * 10);
+        maxDist = sqrt((rows/2)^2 + (cols/2)^2);
+        normDist = dist / maxDist;  % normalise to [0,1]
+
+        % FIX: Area is the dominant signal — large solid regions are the lesion.
+        % Distance penalty is mild and normalised so off-centre lesions aren't unfairly punished.
+        scores(i) = (area * 1.0) + (stats(i).Solidity * 500) - (normDist * 200);
     end
-    
-    % 4. Keep only the highest scoring island
+
     [~, bestIdx] = max(scores);
     finalMask = (L == bestIdx);
 end
-
-
 
 
     
