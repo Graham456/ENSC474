@@ -20,7 +20,7 @@ function project()
     binaryMask = segment_image(featureMap);
     cleanMask  = refine_mask(binaryMask);
     splitMask  = apply_watershed(cleanMask);
-    roughMask  = select_best_lesion(splitMask);
+    roughMask  = select_best_lesion(splitMask, adaptive_out);
     finalMask  = active_contour_refine(roughMask, contrast_out);
 
     figure('Name', 'Pipeline Debug', 'Position', [100 100 1800 900]);
@@ -184,35 +184,38 @@ function imgOut = anisodiff2D(img, niter, lambda, kappa, option)
 end
 
 function featureMap = generate_features(adaptive_out)
-    % Uses adaptive_out directly — CLAHE has not been applied yet so
-    % the lesion is still a clear dark blob with simple intensity contrast.
-    % Multi-scale dark detection will correctly produce a bright response
-    % over the lesion interior.
-    bg_small = imfilter(adaptive_out, fspecial('gaussian', [21 21],  5), 'replicate');
-    bg_med   = imfilter(adaptive_out, fspecial('gaussian', [41 41], 10), 'replicate');
-    bg_large = imfilter(adaptive_out, fspecial('gaussian', [61 61], 15), 'replicate');
-
-    dark_small = max(0, bg_small - adaptive_out);
-    dark_med   = max(0, bg_med   - adaptive_out);
-    dark_large = max(0, bg_large - adaptive_out);
-
-    if max(dark_small(:)) > 0, dark_small = dark_small / max(dark_small(:)); end
-    if max(dark_med(:))   > 0, dark_med   = dark_med   / max(dark_med(:));   end
-    if max(dark_large(:)) > 0, dark_large = dark_large / max(dark_large(:)); end
-
-    rawMap     = (0.2 * dark_small) + (0.3 * dark_med) + (0.5 * dark_large);
-    featureMap = imfilter(rawMap, fspecial('gaussian', [31 31], 8), 'replicate');
-    featureMap = (featureMap - min(featureMap(:))) / ...
-                 (max(featureMap(:)) - min(featureMap(:)));
-
-    fprintf('Feature map — min: %.4f max: %.4f mean: %.4f\n', ...
-        min(featureMap(:)), max(featureMap(:)), mean(featureMap(:)));
+    % 1. Create an ROI mask to ignore the black padding
+    % Anything near pure black is ignored
+    roi = adaptive_out > 0.05; 
+    roi = imerode(roi, strel('disk', 5)); % Shrink to avoid edge artifacts
+    
+    % 2. Enhance dark regions (tumors are hypoechoic)
+    % We use a morphological bottom-hat to find dark spots relative to surroundings
+    se = strel('disk', 25); 
+    darkRegions = imbothat(adaptive_out, se);
+    
+    % 3. Combine with inverse intensity
+    % This highlights pixels that are both dark and "different" from their neighbors
+    rawMap = darkRegions .* (1 - adaptive_out);
+    
+    % 4. Apply ROI mask
+    rawMap(~roi) = 0;
+    
+    % 5. Smooth for a clean "blob"
+    featureMap = imfilter(rawMap, fspecial('gaussian', [21 21], 5), 'replicate');
+    
+    % Normalize
+    if max(featureMap(:)) > min(featureMap(:))
+        featureMap = (featureMap - min(featureMap(:))) / (max(featureMap(:)) - min(featureMap(:)));
+    end
+    featureMap = 1 - featureMap; 
+    featureMap = (featureMap - min(featureMap(:))) / (max(featureMap(:)) - min(featureMap(:)));
 end
 
 function binaryMask = segment_image(featureMap)
     avgVal    = mean(featureMap(:));
     stdVal    = std(featureMap(:));
-    k         = 0.75;
+    k         = 1;
     threshold = avgVal + (k * stdVal);
     binaryMask = featureMap > threshold;
     fprintf('Threshold: %.4f (mean: %.4f std: %.4f)\n', threshold, avgVal, stdVal);
@@ -243,43 +246,31 @@ function cleanMask = apply_watershed(cleanMask)
     cleanMask     = imclose(cleanMask, strel('disk', 1));
 end
 
-function finalMask = select_best_lesion(cleanMask)
+function finalMask = select_best_lesion(cleanMask, originalImg)
     [L, num] = bwlabel(cleanMask);
-    if num == 0
-        finalMask = cleanMask;
-        return;
-    end
-    stats        = regionprops(L, 'Area', 'Centroid', 'Solidity', 'BoundingBox');
-    [rows, cols] = size(cleanMask);
-    imgCenter    = [cols/2, rows/2];
-    maxDist      = sqrt((rows/2)^2 + (cols/2)^2);
-    maxArea      = max([stats.Area]);
-    edgeMargin   = round(min(rows, cols) * 0.05);
-    scores       = zeros(num, 1);
+    if num == 0, finalMask = cleanMask; return; end
+    
+    stats = regionprops(L, 'Area', 'Solidity', 'Centroid', 'PixelIdxList');
+    scores = zeros(num, 1);
+    
     for i = 1:num
-        dist     = sqrt(sum((stats(i).Centroid - imgCenter).^2));
-        normDist = dist / maxDist;
-        normArea = stats(i).Area / maxArea;
-        if normArea < 0.05
-            scores(i) = -Inf;
-            continue;
-        end
-        bb   = stats(i).BoundingBox;
-        xMin = bb(1); yMin = bb(2);
-        xMax = bb(1) + bb(3); yMax = bb(2) + bb(4);
-        touchesEdge = (xMin <= edgeMargin) || ...
-                      (yMin <= edgeMargin) || ...
-                      (xMax >= cols - edgeMargin) || ...
-                      (yMax >= rows - edgeMargin);
-        edgePenalty = 0;
-        if touchesEdge
-            edgePenalty = 200;
-        end
-        scores(i) = (normArea * 500) + (stats(i).Solidity * 300) ...
-                    - (normDist * 100) - edgePenalty;
+        % Calculate local contrast: How dark is this blob vs the whole image?
+        meanIntensity = mean(originalImg(stats(i).PixelIdxList));
+        contrastScore = 1 - meanIntensity; % Higher score for darker blobs
+        
+        % Generalization Rules:
+        % 1. Must be a significant size (not noise)
+        % 2. High solidity (tumors are usually cohesive masses, not lines)
+        % 3. Darker than surroundings
+        
+        areaScore = stats(i).Area / (size(originalImg,1)*size(originalImg,2));
+        
+        % Weighted formula for generalization
+        scores(i) = (stats(i).Solidity * 0.4) + (contrastScore * 0.4) + (areaScore * 0.2);
     end
+    
     [~, bestIdx] = max(scores);
-    finalMask    = (L == bestIdx);
+    finalMask = (L == bestIdx);
 end
 
 function finalMask = active_contour_refine(roughMask, contrast_out)
