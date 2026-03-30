@@ -1,33 +1,40 @@
 function project()
     
-    imagePath = 'projectimg.png'; % 
+    imagePath = 'projectimg.png';
     maskPath  = 'GTmask.png';
 
-    % Phase 1: Preprocessing
     [img, gt] = preprocess_data(imagePath, maskPath);
     
-    % Place to call each function 
     homo_filter_out = homomorphic_filter(img);
-    contrast_out = contrast_enhancement(homo_filter_out);
-    featureMap = generate_features(contrast_out);
+    wiener_out      = wiener_filter(homo_filter_out);
+    adaptive_out    = adaptive_filter(wiener_out);
+    contrast_out    = contrast_enhancement(adaptive_out);
+
+    % FIX: Pass adaptive_out to generate_features instead of contrast_out.
+    % adaptive_out still has the lesion as a clear dark blob because CLAHE
+    % has not yet normalized the interior intensity away.
+    % contrast_out is kept only for active_contour_refine which needs
+    % sharp boundaries rather than a preserved dark blob.
+    featureMap = generate_features(adaptive_out);
+    
     binaryMask = segment_image(featureMap);
-    cleanMask = refine_mask(binaryMask);
-    splitMask = apply_watershed(cleanMask);
-    finalMask = select_best_lesion(splitMask);
-    
-     % DEBUG: show every intermediate stage so we can see where it breaks
-    figure('Name', 'Pipeline Debug', 'Position', [100 100 1400 800]);
-    
-    subplot(2,4,1); imshow(img);            title('1. Raw Input');
-    subplot(2,4,2); imshow(homo_filter_out);title('2. Homomorphic');
-    subplot(2,4,3); imshow(contrast_out);   title('3. Contrast Enhanced');
-    subplot(2,4,4); imshow(featureMap);     title('4. Feature Map');
-    subplot(2,4,5); imshow(binaryMask);     title('5. Binary Mask');
-    subplot(2,4,6); imshow(cleanMask);      title('6. Refined Mask');
-    subplot(2,4,7); imshow(splitMask);      title('7. After Watershed');
-    subplot(2,4,8); imshow(finalMask);      title('8. Final vs GT');
-    
-    % Also print the feature map stats so we can see the value distribution
+    cleanMask  = refine_mask(binaryMask);
+    splitMask  = apply_watershed(cleanMask);
+    roughMask  = select_best_lesion(splitMask);
+    finalMask  = active_contour_refine(roughMask, contrast_out);
+
+    figure('Name', 'Pipeline Debug', 'Position', [100 100 1800 900]);
+    subplot(2,5,1);  imshow(img);            title('1. Raw Input');
+    subplot(2,5,2);  imshow(homo_filter_out);title('2. Homomorphic');
+    subplot(2,5,3);  imshow(wiener_out);     title('3. Wiener');
+    subplot(2,5,4);  imshow(adaptive_out);   title('4. Adaptive');
+    subplot(2,5,5);  imshow(contrast_out);   title('5. Contrast Enhanced');
+    subplot(2,5,6);  imshow(featureMap);     title('6. Feature Map');
+    subplot(2,5,7);  imshow(binaryMask);     title('7. Binary Mask');
+    subplot(2,5,8);  imshow(cleanMask);      title('8. Refined Mask');
+    subplot(2,5,9);  imshow(roughMask);      title('9. Rough Lesion');
+    subplot(2,5,10); imshow(finalMask);      title('10. Final (Snake)');
+
     fprintf('--- Feature Map Stats ---\n');
     fprintf('Min: %.4f, Max: %.4f\n', min(featureMap(:)), max(featureMap(:)));
     fprintf('Mean: %.4f, Std: %.4f\n', mean(featureMap(:)), std(featureMap(:)));
@@ -35,13 +42,11 @@ function project()
     fprintf('Pixels above 0.7: %d\n', sum(featureMap(:) > 0.7));
     fprintf('Pixels above 0.9: %d\n', sum(featureMap(:) > 0.9));
 
-    % Overlay comparison: red = finalMask, green = ground truth
     figure('Name', 'Overlay Comparison');
     overlayImg = zeros(size(img,1), size(img,2), 3);
     gt_resized = imresize(gt, [size(img,1), size(img,2)], 'nearest');
-
-    overlayImg(:,:,1) = double(finalMask);   % red channel = your detection
-    overlayImg(:,:,2) = double(gt_resized);          % green channel = ground truth
+    overlayImg(:,:,1) = double(finalMask);
+    overlayImg(:,:,2) = double(gt_resized);
     imshow(overlayImg);
     title('Red=finalMask | Green=GT | Yellow=Overlap');
 
@@ -53,200 +58,243 @@ end
 function [imgNorm, gtMask] = preprocess_data(imgP, mskP)
     rawImg = im2double(imread(imgP));
     rawGT  = im2double(imread(mskP));
-    if size(rawImg, 3) == 3, rawImg = rgb2gray(rawImg); end % convert to 2D greyscale if images are 2D (RGB)
-    if size(rawGT, 3) == 3,  rawGT  = rgb2gray(rawGT);  end
-    
-    if any(size(rawGT) ~= size(rawImg)) % added when i had to resize GT image to fix error
+    if size(rawImg, 3) == 3, rawImg = rgb2gray(rawImg); end
+    if size(rawGT,  3) == 3, rawGT  = rgb2gray(rawGT);  end
+    if any(size(rawGT) ~= size(rawImg))
         rawGT = imresize(rawGT, [size(rawImg,1), size(rawImg,2)], 'nearest');
-        fprintf('Warning: GT mask resized from original to match image dimensions.\n');
+        fprintf('Warning: GT mask resized to match image dimensions.\n');
     end
-
-    lower = quantile(rawImg(:), 0.01); % remove top and bottom 1% to ignore bright text or black borders
-    upper = quantile(rawImg(:), 0.99); 
-    
+    lower   = quantile(rawImg(:), 0.01);
+    upper   = quantile(rawImg(:), 0.99);
     clipped = max(lower, min(upper, rawImg));
-    
-    imgNorm = (clipped - lower) / (upper - lower); % force intensity to be between 0 and 1
-    
-    gtMask = rawGT > 0.5; % binarize ground truth (need to use for IoU calc later)
+    imgNorm = (clipped - lower) / (upper - lower);
+    gtMask  = rawGT > 0.5;
 end
 
-function homo_filter_out = homomorphic_filter(img) % step 2, homomorphic filtering for speckle reduction
-    
-    imgLog = log(1 + img); % avoid using log(0) 
-    
-    % Perform 2D FFT and shift the zero-frequency component to the center
-    F = fftshift(fft2(imgLog));
-    
-   
-    [M, N] = size(img); % high pass filter kernal
-    [U, V] = meshgrid(1:N, 1:M);
-    
-    % Define the center coordinates
+function homo_filter_out = homomorphic_filter(img)
+    imgLog  = log(1 + img);
+    F       = fftshift(fft2(imgLog));
+    [M, N]  = size(img);
+    [U, V]  = meshgrid(1:N, 1:M);
     centerX = floor(N/2) + 1;
     centerY = floor(M/2) + 1;
-    
-    % D is the distance from the center (frequency origin)
-    D = sqrt((U - centerX).^2 + (V - centerY).^2);
-    
-    % Sigma controls the 'cutoff'. 
-    % Lower sigma = smoother/blurrier, Higher sigma = sharper/more noise kept.
-    sigma = 30; 
-    gammaL = 0.5;
-    gammaH = 1.5;
-
-    H = (gammaH - gammaL) * (1 - exp(-(D.^2) / (2 * sigma^2))) + gammaL;
-    
-    % 4. Apply the Filter
-    G = F .* H;
-    imgFiltered = real(ifft2(ifftshift(G)));
-   
+    D       = sqrt((U - centerX).^2 + (V - centerY).^2);
+    sigma   = 0.1 * mean([M, N]);
+    gammaL  = 0.3;
+    gammaH  = 1.8;
+    H       = (gammaH - gammaL) * (1 - exp(-(D.^2) / (2 * sigma^2))) + gammaL;
+    G       = F .* H;
+    imgFiltered     = real(ifft2(ifftshift(G)));
     homo_filter_out = exp(imgFiltered) - 1;
-    % Standardize the output to [0, 1] for Phase 3 (Contrast Enhancement)
     if max(homo_filter_out(:)) > min(homo_filter_out(:))
-        homo_filter_out = (homo_filter_out - min(homo_filter_out(:))) / (max(homo_filter_out(:)) - min(homo_filter_out(:))); % standardize output to [0,1] for Phase 3 contrast enhancement
+        homo_filter_out = (homo_filter_out - min(homo_filter_out(:))) / ...
+                          (max(homo_filter_out(:)) - min(homo_filter_out(:)));
     end
 end
 
-% Phase 3: Contrast enhancement
-
-
-function contrast_out = contrast_enhancement(homo_filter_out) 
-    % --- Step A: Local Contrast Enhancement ---
-    % We use a local mean to adjust intensities
-    % Define a local window size (e.g., 15x15)
-    h = ones(15,15) / (15*15);
-    localMean = imfilter(homo_filter_out, h, 'replicate');
-    
-    % Enhance: Output = Gain * (Input - localMean) + localMean
-    % A gain > 1 increases local contrast
-    gain = 1.5;
-    localEnhanced = gain * (homo_filter_out - localMean) + localMean;
-    % Create a blurred version
-    blurKernel = fspecial('gaussian', [15 15], 3);
-    blurred = imfilter(localEnhanced, blurKernel, 'replicate');
-    
-    % Mask = Original - Blurred (this contains only the edges/details)
-    mask = localEnhanced - blurred;
-    
-    % High-boost: Result = Original + k * Mask
-    % If k=1, it's standard unsharp masking. If k > 1, it's high-boost.
-    k = 2.0; 
-    contrast_out = localEnhanced + k * mask;
-    
-    % Final clip and normalize to keep it in [0, 1]
-    contrast_out = max(0, min(1, contrast_out));
+function wiener_out = wiener_filter(img)
+    wiener_out = wiener2(img, [5 5]);
+    if max(wiener_out(:)) > min(wiener_out(:))
+        wiener_out = (wiener_out - min(wiener_out(:))) / ...
+                     (max(wiener_out(:)) - min(wiener_out(:)));
+    end
+    fprintf('Wiener filter complete\n');
 end
 
-function featureMap = generate_features(contrast_out)
-    Gx = [-1 0 1; -2 0 2; -1 0 1];
-    Gy = [1 2 1; 0 0 0; -1 -2 -1];
-    gradX = imfilter(contrast_out, Gx, 'replicate');
-    gradY = imfilter(contrast_out, Gy, 'replicate');
-    gradMag = sqrt(gradX.^2 + gradY.^2);
-    if max(gradMag(:)) > 0
-        gradMag = gradMag / max(gradMag(:));
+function adaptive_out = adaptive_filter(img)
+    [rows, cols] = size(img);
+    adaptive_out = img;
+    maxWin = 7;
+    for r = 1:rows
+        for c = 1:cols
+            winSize = 3;
+            done = false;
+            while ~done && winSize <= maxWin
+                rMin = max(1, r - floor(winSize/2));
+                rMax = min(rows, r + floor(winSize/2));
+                cMin = max(1, c - floor(winSize/2));
+                cMax = min(cols, c + floor(winSize/2));
+                window = img(rMin:rMax, cMin:cMax);
+                zMin   = min(window(:));
+                zMax   = max(window(:));
+                zMed   = median(window(:));
+                zxy    = img(r, c);
+                if zMed > zMin && zMed < zMax
+                    if zxy > zMin && zxy < zMax
+                        adaptive_out(r, c) = zxy;
+                    else
+                        adaptive_out(r, c) = zMed;
+                    end
+                    done = true;
+                else
+                    winSize = winSize + 2;
+                end
+            end
+            if ~done
+                rMin = max(1, r - floor(maxWin/2));
+                rMax = min(rows, r + floor(maxWin/2));
+                cMin = max(1, c - floor(maxWin/2));
+                cMax = min(cols, c + floor(maxWin/2));
+                adaptive_out(r, c) = median(img(rMin:rMax, cMin:cMax), 'all');
+            end
+        end
     end
-
-    hVar = ones(7,7) / (7*7);
-    mu  = imfilter(contrast_out, hVar, 'replicate');
-    mu2 = imfilter(contrast_out.^2, hVar, 'replicate');
-    localVar = max(0, mu2 - mu.^2);
-    if max(localVar(:)) > 0
-        localVar = localVar / max(localVar(:));
+    if max(adaptive_out(:)) > min(adaptive_out(:))
+        adaptive_out = (adaptive_out - min(adaptive_out(:))) / ...
+                       (max(adaptive_out(:)) - min(adaptive_out(:)));
     end
-
-    % Go back to hypoechoic (dark tumor) assumption but with gentler smoothing
-    intensityFeature = 1 - contrast_out;
-
-    rawMap = (0.5 * intensityFeature) + (0.25 * gradMag) + (0.25 * localVar);
-
-    % Single moderate gaussian — previous large sigma was destroying boundaries
-    smoothedMap = imfilter(rawMap, fspecial('gaussian', [21 21], 4.0), 'replicate');
-
-    featureMap = (smoothedMap - min(smoothedMap(:))) / ...
-                 (max(smoothedMap(:)) - min(smoothedMap(:)));
+    fprintf('Adaptive median filter complete\n');
 end
+
+function contrast_out = contrast_enhancement(homo_filter_out)
+    [M, N] = size(homo_filter_out);
+    tileSize    = max(2, round(min(M,N) / 8));
+    numTilesRow = max(2, round(M / tileSize));
+    numTilesCol = max(2, round(N / tileSize));
+    noiseEstimate = std(homo_filter_out(:));
+    clipLimit = max(0.005, min(0.04, 0.02 / noiseEstimate));
+    contrast_out = adapthisteq(homo_filter_out, ...
+        'ClipLimit',    clipLimit, ...
+        'NumTiles',     [numTilesRow numTilesCol], ...
+        'Distribution', 'rayleigh');
+    contrast_out = anisodiff2D(contrast_out, 3, 0.15, 30, 1);
+end
+
+function imgOut = anisodiff2D(img, niter, lambda, kappa, option)
+    imgOut = img;
+    for i = 1:niter
+        deltaN = circshift(imgOut, [-1  0]) - imgOut;
+        deltaS = circshift(imgOut, [ 1  0]) - imgOut;
+        deltaE = circshift(imgOut, [ 0  1]) - imgOut;
+        deltaW = circshift(imgOut, [ 0 -1]) - imgOut;
+        if option == 1
+            cN = exp(-(deltaN/kappa).^2);
+            cS = exp(-(deltaS/kappa).^2);
+            cE = exp(-(deltaE/kappa).^2);
+            cW = exp(-(deltaW/kappa).^2);
+        else
+            cN = 1 ./ (1 + (deltaN/kappa).^2);
+            cS = 1 ./ (1 + (deltaS/kappa).^2);
+            cE = 1 ./ (1 + (deltaE/kappa).^2);
+            cW = 1 ./ (1 + (deltaW/kappa).^2);
+        end
+        imgOut = imgOut + lambda * (cN.*deltaN + cS.*deltaS + ...
+                                    cE.*deltaE + cW.*deltaW);
+    end
+end
+
+function featureMap = generate_features(adaptive_out)
+    % Uses adaptive_out directly — CLAHE has not been applied yet so
+    % the lesion is still a clear dark blob with simple intensity contrast.
+    % Multi-scale dark detection will correctly produce a bright response
+    % over the lesion interior.
+    bg_small = imfilter(adaptive_out, fspecial('gaussian', [21 21],  5), 'replicate');
+    bg_med   = imfilter(adaptive_out, fspecial('gaussian', [41 41], 10), 'replicate');
+    bg_large = imfilter(adaptive_out, fspecial('gaussian', [61 61], 15), 'replicate');
+
+    dark_small = max(0, bg_small - adaptive_out);
+    dark_med   = max(0, bg_med   - adaptive_out);
+    dark_large = max(0, bg_large - adaptive_out);
+
+    if max(dark_small(:)) > 0, dark_small = dark_small / max(dark_small(:)); end
+    if max(dark_med(:))   > 0, dark_med   = dark_med   / max(dark_med(:));   end
+    if max(dark_large(:)) > 0, dark_large = dark_large / max(dark_large(:)); end
+
+    rawMap     = (0.2 * dark_small) + (0.3 * dark_med) + (0.5 * dark_large);
+    featureMap = imfilter(rawMap, fspecial('gaussian', [31 31], 8), 'replicate');
+    featureMap = (featureMap - min(featureMap(:))) / ...
+                 (max(featureMap(:)) - min(featureMap(:)));
+
+    fprintf('Feature map — min: %.4f max: %.4f mean: %.4f\n', ...
+        min(featureMap(:)), max(featureMap(:)), mean(featureMap(:)));
+end
+
 function binaryMask = segment_image(featureMap)
-    avgVal = mean(featureMap(:));
-    stdVal = std(featureMap(:));
-
-    % k=0.8 is a middle ground — strict enough to cut noise,
-    % loose enough to capture a large lesion region
-    k = 0.7;
+    avgVal    = mean(featureMap(:));
+    stdVal    = std(featureMap(:));
+    k         = 0.75;
     threshold = avgVal + (k * stdVal);
     binaryMask = featureMap > threshold;
-
-    fprintf('Phase 5: Threshold set at %.4f (Mean: %.4f, Std: %.4f)\n', ...
-            threshold, avgVal, stdVal);
+    fprintf('Threshold: %.4f (mean: %.4f std: %.4f)\n', threshold, avgVal, stdVal);
 end
+
 function cleanMask = refine_mask(binaryMask)
     [rows, ~] = size(binaryMask);
     binaryMask(rows-10:rows, :) = 0;
 
-    % FIX: Use smaller structuring element — radius 5 was eroding small
-    % detections into nothing before they could be grown
-    se_open  = strel('disk', 2);
-    se_close = strel('disk', 8);  % larger closing to bridge internal gaps
-
+    se_open = strel('disk', 2);
     cleanMask = imopen(binaryMask, se_open);
+
+    se_seal = strel('disk', 12);
+    cleanMask = imclose(cleanMask, se_seal);
     cleanMask = imfill(cleanMask, 'holes');
-    cleanMask = imclose(cleanMask, se_close);
-    cleanMask = imfill(cleanMask, 'holes');  % fill again after closing
+
+    se_smooth = strel('disk', 4);
+    cleanMask = imclose(cleanMask, se_smooth);
+    cleanMask = imfill(cleanMask, 'holes');
 end
-%APPLY WATERSHEDDING TO FINAL MASK
+
 function cleanMask = apply_watershed(cleanMask)
-    % 1. Compute Distance Transform
-    % Calculates the distance from every '1' to the nearest '0'.
-    % The center of the tumor becomes the deepest point.
-    D = bwdist(~cleanMask);
-    
-    % 2. Invert the distance map so the centers become 'Basins' (minima)
-    D = -D;
-    
-    % 3. Force pixels outside the refinedMask to be 'Infinity'
-    % This prevents the 'water' from leaking into the background.
+    D             = bwdist(~cleanMask);
+    D             = -D;
     D(~cleanMask) = Inf;
-    
-    % 4. Apply Watershed
-    % L contains labels for each 'flooded' basin.
-    L = watershed(D);
-    
-    % 5. Extract the objects
-    % Watershed lines (dams) are marked as 0. Everything else is a basin.
-    cleanMask = (L > 0) & cleanMask;
-    
-    % 6. Optional: Close tiny gaps created by the watershed lines
-    cleanMask = imclose(cleanMask, strel('disk', 1));
+    L             = watershed(D);
+    cleanMask     = (L > 0) & cleanMask;
+    cleanMask     = imclose(cleanMask, strel('disk', 1));
 end
 
 function finalMask = select_best_lesion(cleanMask)
     [L, num] = bwlabel(cleanMask);
-
     if num == 0
         finalMask = cleanMask;
         return;
     end
-
-    stats = regionprops(L, 'Area', 'Centroid', 'Solidity');
+    stats        = regionprops(L, 'Area', 'Centroid', 'Solidity', 'BoundingBox');
     [rows, cols] = size(cleanMask);
-    imgCenter = [cols/2, rows/2];
-
-    scores = zeros(num, 1);
+    imgCenter    = [cols/2, rows/2];
+    maxDist      = sqrt((rows/2)^2 + (cols/2)^2);
+    maxArea      = max([stats.Area]);
+    edgeMargin   = round(min(rows, cols) * 0.05);
+    scores       = zeros(num, 1);
     for i = 1:num
-        dist = sqrt(sum((stats(i).Centroid - imgCenter).^2));
-        area = stats(i).Area;
-        maxDist = sqrt((rows/2)^2 + (cols/2)^2);
-        normDist = dist / maxDist;  % normalise to [0,1]
-
-        % FIX: Area is the dominant signal — large solid regions are the lesion.
-        % Distance penalty is mild and normalised so off-centre lesions aren't unfairly punished.
-        scores(i) = (area * 1.0) + (stats(i).Solidity * 500) - (normDist * 200);
+        dist     = sqrt(sum((stats(i).Centroid - imgCenter).^2));
+        normDist = dist / maxDist;
+        normArea = stats(i).Area / maxArea;
+        if normArea < 0.05
+            scores(i) = -Inf;
+            continue;
+        end
+        bb   = stats(i).BoundingBox;
+        xMin = bb(1); yMin = bb(2);
+        xMax = bb(1) + bb(3); yMax = bb(2) + bb(4);
+        touchesEdge = (xMin <= edgeMargin) || ...
+                      (yMin <= edgeMargin) || ...
+                      (xMax >= cols - edgeMargin) || ...
+                      (yMax >= rows - edgeMargin);
+        edgePenalty = 0;
+        if touchesEdge
+            edgePenalty = 200;
+        end
+        scores(i) = (normArea * 500) + (stats(i).Solidity * 300) ...
+                    - (normDist * 100) - edgePenalty;
     end
-
     [~, bestIdx] = max(scores);
-    finalMask = (L == bestIdx);
+    finalMask    = (L == bestIdx);
 end
 
-
-    
+function finalMask = active_contour_refine(roughMask, contrast_out)
+    se_shrink = strel('disk', 10);
+    initMask  = imerode(roughMask, se_shrink);
+    if sum(initMask(:)) == 0
+        initMask = imerode(roughMask, strel('disk', 3));
+    end
+    if sum(initMask(:)) == 0
+        finalMask = roughMask;
+        fprintf('Active contour skipped — initial mask too small after erosion\n');
+        return;
+    end
+    finalMask = activecontour(contrast_out, initMask, 200, 'Chan-Vese', ...
+        'SmoothFactor',    3, ...
+        'ContractionBias', -0.05);
+    fprintf('Active contour refinement complete\n');
+end
